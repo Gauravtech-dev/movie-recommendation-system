@@ -213,17 +213,18 @@ async def get_omdb_details(title: str):
 
 
 def local_tmdb_poster(title: str) -> Optional[str]:
-    """Build a poster URL from the local TMDB metadata when available."""
+    """Return the TMDB poster URL stored in the local metadata CSV."""
     if movies is None or "poster_path" not in movies.columns:
         return None
 
-    query = normalize_title(title)
-    exact = movies[movies["title"].str.lower() == query]
+    key = normalize_title(title)
+
+    exact = movies[movies["title"].str.lower() == key]
 
     if exact.empty:
         partial = movies[
             movies["title"].str.lower().str.contains(
-                query, regex=False, na=False
+                key, regex=False, na=False
             )
         ]
         if partial.empty:
@@ -233,10 +234,12 @@ def local_tmdb_poster(title: str) -> Optional[str]:
         row = exact.iloc[0]
 
     path = row.get("poster_path")
+
     if path is None or pd.isna(path):
         return None
 
     path = str(path).strip()
+
     if not path or path.lower() in {"nan", "none", "n/a"}:
         return None
 
@@ -246,22 +249,22 @@ def local_tmdb_poster(title: str) -> Optional[str]:
     if not path.startswith("/"):
         path = "/" + path
 
-    return f"https://image.tmdb.org/t/p/w500{path}"
+    return "https://image.tmdb.org/t/p/w500" + path
 
 
 async def get_omdb_poster(title: str) -> Optional[str]:
     """
     Poster priority:
-    1) local TMDB poster_path (fast and reliable)
-    2) exact OMDb title lookup
-    3) OMDb search fallback
+    1. Local TMDB poster_path from movies_metadata.csv
+    2. Exact OMDb title lookup
+    3. OMDb search fallback
     """
     key = normalize_title(title)
 
     if key in POSTER_CACHE:
         return POSTER_CACHE[key]
 
-    # 1. Local TMDB metadata poster
+    # 1. Local TMDB poster
     local_poster = local_tmdb_poster(title)
     if local_poster:
         POSTER_CACHE[key] = local_poster
