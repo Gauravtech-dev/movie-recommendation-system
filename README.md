@@ -3,9 +3,6 @@
 **Live Application:**  
 https://movie-recommendation-system-gyd39xtdw2tvjqcvatfuj8.streamlit.app/
 
-**Backend API:**  
-https://movie-recommendation-system-pdca.onrender.com
-
 The backend is deployed on Render. The Streamlit frontend can be added here when its public URL is finalized.
 
 📌 Overview
