@@ -212,73 +212,28 @@ async def get_omdb_details(title: str):
     return data
 
 
-def local_tmdb_poster(title: str) -> Optional[str]:
-    """Return the TMDB poster URL stored in the local metadata CSV."""
-    if movies is None or "poster_path" not in movies.columns:
-        return None
-
-    key = normalize_title(title)
-
-    exact = movies[movies["title"].str.lower() == key]
-
-    if exact.empty:
-        partial = movies[
-            movies["title"].str.lower().str.contains(
-                key, regex=False, na=False
-            )
-        ]
-        if partial.empty:
-            return None
-        row = partial.iloc[0]
-    else:
-        row = exact.iloc[0]
-
-    path = row.get("poster_path")
-
-    if path is None or pd.isna(path):
-        return None
-
-    path = str(path).strip()
-
-    if not path or path.lower() in {"nan", "none", "n/a"}:
-        return None
-
-    if path.startswith("http://") or path.startswith("https://"):
-        return path
-
-    if not path.startswith("/"):
-        path = "/" + path
-
-    return "https://image.tmdb.org/t/p/w500" + path
-
-
 async def get_omdb_poster(title: str) -> Optional[str]:
     """
-    Poster priority:
-    1. Local TMDB poster_path from movies_metadata.csv
-    2. Exact OMDb title lookup
-    3. OMDb search fallback
+    Get a poster using the exact OMDb title lookup first.
+    If that fails, use OMDb search as a fallback.
+    This fixes many missing posters caused by title differences
+    between the local dataset and OMDb.
     """
     key = normalize_title(title)
 
     if key in POSTER_CACHE:
         return POSTER_CACHE[key]
 
-    # 1. Local TMDB poster
-    local_poster = local_tmdb_poster(title)
-    if local_poster:
-        POSTER_CACHE[key] = local_poster
-        return local_poster
-
-    # 2. Exact OMDb title lookup
+    # 1. Exact title lookup
     data = await get_omdb_details(title)
+
     poster = data.get("Poster") if data else None
 
     if poster and poster != "N/A":
         POSTER_CACHE[key] = poster
         return poster
 
-    # 3. OMDb search fallback
+    # 2. Fallback: OMDb search
     search_data = await omdb_request(
         {"s": title, "type": "movie"},
         allow_not_found=True,
@@ -287,6 +242,7 @@ async def get_omdb_poster(title: str) -> Optional[str]:
     if search_data:
         search_results = search_data.get("Search") or []
 
+        # Prefer exact normalized title match
         for item in search_results:
             result_title = item.get("Title", "")
             result_poster = item.get("Poster")
@@ -299,6 +255,7 @@ async def get_omdb_poster(title: str) -> Optional[str]:
                 POSTER_CACHE[key] = result_poster
                 return result_poster
 
+        # Otherwise use first usable movie poster
         for item in search_results:
             result_poster = item.get("Poster")
             if result_poster and result_poster != "N/A":
@@ -558,9 +515,6 @@ async def movie_details(movie_id: int):
 
     if poster == "N/A":
         poster = None
-
-    if not poster:
-        poster = local_tmdb_poster(title)
 
     return MovieDetails(
         movie_id=movie_id,
