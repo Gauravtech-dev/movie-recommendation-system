@@ -1,7 +1,6 @@
 import os
 import ast
 import pickle
-import asyncio
 from typing import Optional, List, Dict, Any, Tuple
 
 import numpy as np
@@ -14,7 +13,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-OMDB_API_KEY =  os.getenv("OMDB_API_KEY")      
+OMDB_API_KEY = os.getenv("OMDB_API_KEY")
 OMDB_BASE_URL = "https://www.omdbapi.com/"
 
 if not OMDB_API_KEY:
@@ -27,7 +26,7 @@ INDICES_PATH = os.path.join(BASE_DIR, "indices.pkl")
 TFIDF_MATRIX_PATH = os.path.join(BASE_DIR, "tfidf_matrix.pkl")
 TFIDF_PATH = os.path.join(BASE_DIR, "tfidf.pkl")
 
-app = FastAPI(title="Movie Recommender API", version="5.0")
+app = FastAPI(title="Movie Recommender API", version="4.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -42,12 +41,10 @@ indices_obj = None
 tfidf_matrix = None
 tfidf_obj = None
 TITLE_TO_IDX = {}
-POSTER_CACHE: Dict[str, Optional[str]] = {}
-DETAIL_CACHE: Dict[str, Dict[str, Any]] = {}
 
 
 class MovieCard(BaseModel):
-    movie_id: int
+    tmdb_id: int
     title: str
     poster_url: Optional[str] = None
     release_date: Optional[str] = None
@@ -55,7 +52,7 @@ class MovieCard(BaseModel):
 
 
 class MovieDetails(BaseModel):
-    movie_id: int
+    tmdb_id: int
     title: str
     overview: Optional[str] = None
     release_date: Optional[str] = None
@@ -68,7 +65,7 @@ class MovieDetails(BaseModel):
 class TFIDFRecItem(BaseModel):
     title: str
     score: float
-    movie: Optional[MovieCard] = None
+    tmdb: Optional[MovieCard] = None
 
 
 class SearchBundleResponse(BaseModel):
@@ -109,6 +106,16 @@ def get_genre_names(value) -> List[str]:
     ]
 
 
+def local_poster_url(row) -> Optional[str]:
+    path = row.get("poster_path") if hasattr(row, "get") else None
+    if path is None or pd.isna(path) or not str(path).strip():
+        return None
+    path = str(path).strip()
+    if path.startswith("http://") or path.startswith("https://"):
+        return path
+    return f"https://image.tmdb.org/t/p/w500{path}"
+
+
 @app.on_event("startup")
 def load_resources():
     global movies, df, indices_obj, tfidf_matrix, tfidf_obj, TITLE_TO_IDX
@@ -147,84 +154,23 @@ def load_resources():
     print("TF-IDF resources loaded successfully")
 
 
-async def omdb_request(params: Dict[str, Any], allow_not_found: bool = False):
+async def omdb_request(params: Dict[str, Any]):
     query = dict(params)
     query["apikey"] = OMDB_API_KEY
-
     try:
         async with httpx.AsyncClient(timeout=20) as client:
             response = await client.get(OMDB_BASE_URL, params=query)
         response.raise_for_status()
         data = response.json()
-
         if data.get("Response") == "False":
-            if allow_not_found:
-                return None
-            raise HTTPException(
-                status_code=404,
-                detail=data.get("Error", "Movie not found")
-            )
+            raise HTTPException(status_code=404, detail=data.get("Error", "Movie not found"))
         return data
     except HTTPException:
         raise
     except httpx.RequestError as e:
-        if allow_not_found:
-            return None
         raise HTTPException(status_code=502, detail=f"OMDb request failed: {str(e)}")
     except Exception as e:
-        if allow_not_found:
-            return None
         raise HTTPException(status_code=500, detail=f"Unexpected error: {str(e)}")
-
-
-async def get_omdb_details(title: str):
-    key = normalize_title(title)
-    if key in DETAIL_CACHE:
-        return DETAIL_CACHE[key]
-    data = await omdb_request({"t": title, "plot": "full"}, allow_not_found=True)
-    if data:
-        DETAIL_CACHE[key] = data
-    return data
-
-
-async def get_omdb_poster(title: str) -> Optional[str]:
-    key = normalize_title(title)
-    if key in POSTER_CACHE:
-        return POSTER_CACHE[key]
-
-    data = await get_omdb_details(title)
-    poster = data.get("Poster") if data else None
-    if poster == "N/A":
-        poster = None
-    POSTER_CACHE[key] = poster
-    return poster
-
-
-async def enrich_cards(rows) -> List[MovieCard]:
-    rows = list(rows)
-
-    # rows comes from DataFrame.itertuples(), so each row is a namedtuple.
-    posters = await asyncio.gather(
-        *(get_omdb_poster(str(row.title)) for row in rows)
-    )
-
-    cards = []
-
-    for row, poster in zip(rows, posters):
-        release_date = getattr(row, "release_date", "")
-        vote_average = getattr(row, "vote_average", None)
-
-        cards.append(
-            MovieCard(
-                movie_id=int(row.id),
-                title=str(row.title),
-                poster_url=poster,
-                release_date=str(release_date) or None,
-                vote_average=safe_float(vote_average),
-            )
-        )
-
-    return cards
 
 
 def find_movie_by_id(movie_id: int):
@@ -240,9 +186,17 @@ def find_movie_by_title(title: str):
     if not exact.empty:
         return exact.iloc[0]
     partial = movies[movies["title"].str.lower().str.contains(query, regex=False, na=False)]
-    if not partial.empty:
-        return partial.iloc[0]
-    return None
+    return partial.iloc[0] if not partial.empty else None
+
+
+def make_movie_card(row) -> MovieCard:
+    return MovieCard(
+        tmdb_id=int(row["id"]),
+        title=str(row["title"]),
+        poster_url=local_poster_url(row),
+        release_date=str(row["release_date"]) if row["release_date"] else None,
+        vote_average=safe_float(row.get("vote_average")),
+    )
 
 
 def tfidf_recommend_titles(query_title: str, top_n: int = 10) -> List[Tuple[str, float]]:
@@ -255,14 +209,14 @@ def tfidf_recommend_titles(query_title: str, top_n: int = 10) -> List[Tuple[str,
     else:
         matches = [title for title in TITLE_TO_IDX if key in title]
         if not matches:
-            return []
+            raise HTTPException(status_code=404, detail=f"Title not found in TF-IDF dataset: {query_title}")
         idx = TITLE_TO_IDX[matches[0]]
 
     query_vector = tfidf_matrix[idx]
     scores = (tfidf_matrix @ query_vector.T).toarray().ravel()
     order = np.argsort(-scores)
+    results = []
 
-    recommendations = []
     for i in order:
         if int(i) == int(idx):
             continue
@@ -270,12 +224,10 @@ def tfidf_recommend_titles(query_title: str, top_n: int = 10) -> List[Tuple[str,
             title = str(df.iloc[int(i)]["title"])
         except Exception:
             continue
-        if not title.strip():
-            continue
-        recommendations.append((title, float(scores[int(i)])))
-        if len(recommendations) >= top_n:
+        results.append((title, float(scores[int(i)])))
+        if len(results) >= top_n:
             break
-    return recommendations
+    return results
 
 
 @app.get("/health")
@@ -288,10 +240,7 @@ def health():
 
 
 @app.get("/home", response_model=List[MovieCard])
-async def home(
-    category: str = Query("popular"),
-    limit: int = Query(24, ge=1, le=30),
-):
+async def home(category: str = Query("popular"), limit: int = Query(24, ge=1, le=50)):
     data = movies.copy()
 
     if category in {"popular", "trending"}:
@@ -301,16 +250,17 @@ async def home(
     elif category == "now_playing":
         data = data.sort_values("release_date", ascending=False)
     elif category == "upcoming":
+        today = pd.Timestamp.today()
         dates = pd.to_datetime(data["release_date"], errors="coerce")
-        data = data[dates > pd.Timestamp.today()]
+        data = data[dates > today]
     else:
         raise HTTPException(status_code=400, detail="Invalid category.")
 
     data = data[data["title"].str.strip() != ""].head(limit)
-    return await enrich_cards(data.itertuples(index=False))
+    return [make_movie_card(row) for _, row in data.iterrows()]
 
 
-@app.get("/search")
+@app.get("/tmdb/search")
 async def movie_search(query: str = Query(..., min_length=1)):
     data = await omdb_request({"s": query, "type": "movie"})
     results = []
@@ -318,44 +268,43 @@ async def movie_search(query: str = Query(..., min_length=1)):
     for item in data.get("Search", []):
         title = item.get("Title", "")
         local_movie = find_movie_by_title(title)
-        local_id = int(local_movie["id"]) if local_movie is not None else 0
+        if local_movie is None:
+            continue
+
         poster = item.get("Poster")
         if poster == "N/A":
             poster = None
+
         results.append({
-            "id": local_id,
+            "id": int(local_movie["id"]),
             "title": title,
-            "poster_url": poster,
+            "poster_path": poster,
+            "poster_url": poster or local_poster_url(local_movie),
             "release_date": item.get("Year", ""),
             "imdb_id": item.get("imdbID"),
         })
 
-    return {"results": results, "total_results": len(results)}
+    return {"page": 1, "results": results, "total_results": len(results)}
 
 
 @app.get("/movie/id/{movie_id}", response_model=MovieDetails)
 async def movie_details(movie_id: int):
     row = find_movie_by_id(movie_id)
     title = str(row["title"])
-    data = await get_omdb_details(title)
-
-    if not data:
-        raise HTTPException(status_code=404, detail="Movie details not found in OMDb.")
+    data = await omdb_request({"t": title, "plot": "full"})
 
     genres = []
     if data.get("Genre"):
-        genres = [{"name": g.strip()} for g in data["Genre"].split(",")]
+        genres = [{"name": g.strip()} for g in data["Genre"].split(",") if g.strip()]
 
-    rating = None
-    if data.get("imdbRating") not in {None, "N/A"}:
-        rating = safe_float(data.get("imdbRating"))
-
+    rating = safe_float(data.get("imdbRating")) if data.get("imdbRating") != "N/A" else None
     poster = data.get("Poster")
     if poster == "N/A":
         poster = None
+    poster = poster or local_poster_url(row)
 
     return MovieDetails(
-        movie_id=movie_id,
+        tmdb_id=movie_id,
         title=data.get("Title", title),
         overview=data.get("Plot"),
         release_date=data.get("Released"),
@@ -367,27 +316,21 @@ async def movie_details(movie_id: int):
 
 
 @app.get("/recommend/genre", response_model=List[MovieCard])
-async def recommend_genre(
-    movie_id: int = Query(...),
-    limit: int = Query(18, ge=1, le=30),
-):
-    selected = find_movie_by_id(movie_id)
+async def recommend_genre(tmdb_id: int = Query(...), limit: int = Query(18, ge=1, le=50)):
+    selected = find_movie_by_id(tmdb_id)
     genres = get_genre_names(selected.get("genres"))
     if not genres:
         return []
 
     target_genre = genres[0]
-    mask = movies["genres"].apply(lambda x: target_genre in get_genre_names(x))
-    recommendations = movies[mask & (movies["id"] != movie_id)]
+    mask = movies["genres"].apply(lambda value: target_genre in get_genre_names(value))
+    recommendations = movies[mask & (movies["id"] != tmdb_id)]
     recommendations = recommendations.sort_values("popularity", ascending=False).head(limit)
-    return await enrich_cards(recommendations.itertuples(index=False))
+    return [make_movie_card(row) for _, row in recommendations.iterrows()]
 
 
 @app.get("/recommend/tfidf")
-async def recommend_tfidf(
-    title: str = Query(..., min_length=1),
-    top_n: int = Query(10, ge=1, le=30),
-):
+async def recommend_tfidf(title: str = Query(..., min_length=1), top_n: int = Query(10, ge=1, le=50)):
     recommendations = tfidf_recommend_titles(title, top_n)
     return [{"title": title, "score": score} for title, score in recommendations]
 
@@ -395,8 +338,8 @@ async def recommend_tfidf(
 @app.get("/movie/search", response_model=SearchBundleResponse)
 async def search_bundle(
     query: str = Query(..., min_length=1),
-    tfidf_top_n: int = Query(12, ge=1, le=20),
-    genre_limit: int = Query(12, ge=1, le=20),
+    tfidf_top_n: int = Query(12, ge=1, le=30),
+    genre_limit: int = Query(12, ge=1, le=30),
 ):
     local_movie = find_movie_by_title(query)
     if local_movie is None:
@@ -404,26 +347,15 @@ async def search_bundle(
 
     movie_id = int(local_movie["id"])
     details = await movie_details(movie_id)
+    recs = tfidf_recommend_titles(details.title, tfidf_top_n)
 
-    tfidf_recs = tfidf_recommend_titles(details.title, tfidf_top_n)
     tfidf_items = []
-
-    for title, score in tfidf_recs:
+    for title, score in recs:
         local = find_movie_by_title(title)
-        card = None
-        if local is not None:
-            poster = await get_omdb_poster(title)
-            card = MovieCard(
-                movie_id=int(local["id"]),
-                title=str(local["title"]),
-                poster_url=poster,
-                release_date=str(local.get("release_date", "")) or None,
-                vote_average=safe_float(local.get("vote_average")),
-            )
-        tfidf_items.append(TFIDFRecItem(title=title, score=score, movie=card))
+        card = make_movie_card(local) if local is not None else None
+        tfidf_items.append(TFIDFRecItem(title=title, score=score, tmdb=card))
 
     genre_recs = await recommend_genre(movie_id, genre_limit)
-
     return SearchBundleResponse(
         query=query,
         movie_details=details,
