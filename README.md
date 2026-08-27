@@ -1,10 +1,10 @@
-🌐 Live Demo
+# 🌐 Live Demo
 
-Backend API:
+**Live Application:**  
+https://movie-recommendation-system-gyd39xtdw2tvjqcvatfuj8.streamlit.app/
+
+**Backend API:**  
 https://movie-recommendation-system-pdca.onrender.com
-
-Health Check:
-https://movie-recommendation-system-pdca.onrender.com/health
 
 The backend is deployed on Render. The Streamlit frontend can be added here when its public URL is finalized.
 
